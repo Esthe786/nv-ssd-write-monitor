@@ -30,10 +30,16 @@ function Get-Verdict([double]$mbh) {
     return @('HIGH - bug likely', 'Red')                   # 621.14 ~6 GB/h, 621.24 up to 30 GB/h
 }
 
-function Get-Main {
-    # the NVDisplay.Container.exe instance with the most writes
-    Get-CimInstance Win32_Process -Filter "Name='NVDisplay.Container.exe'" |
-        Sort-Object WriteTransferCount -Descending | Select-Object -First 1
+function Get-Instances {
+    # every NVDisplay.Container.exe instance (there are usually two: the service and its child)
+    @(Get-CimInstance Win32_Process -Filter "Name='NVDisplay.Container.exe'")
+}
+
+function Get-Counters($procs) {
+    # PID -> bytes written so far
+    $h = @{}
+    foreach ($x in $procs) { $h[[int]$x.ProcessId] = [double]$x.WriteTransferCount }
+    $h
 }
 
 $drv = Get-NvDriver
@@ -46,15 +52,17 @@ Write-Host ("Sample every {0}s, hourly summary. Log: {1}" -f $IntervalSec, $csv)
 Write-Host 'Thresholds: <=50 MB/h normal | <=1000 elevated | >1000 high.  Ctrl+C to stop.' -ForegroundColor DarkGray
 Write-Host ''
 
-'time,pid,write_mb_total,delta_mb,nvlog_bytes' | Out-File $csv -Encoding utf8
+'time,pids,write_mb_total,delta_mb,nvlog_bytes' | Out-File $csv -Encoding utf8
 
-$start     = Get-Date
-$p         = Get-Main
-if (-not $p) { Write-Host 'NVDisplay.Container.exe is not running.' -ForegroundColor Red; exit 1 }
-$lastPid   = $p.ProcessId
-$lastMB    = $p.WriteTransferCount / 1MB
-$upH       = ((Get-Date) - $p.CreationDate).TotalHours
-Write-Host ("PID {0} already wrote {1:N1} MB since it started {2:N1} h ago (~{3:N0} MB/h, includes boot burst)" -f $lastPid, $lastMB, $upH, ($lastMB / [math]::Max($upH, 0.01)))
+$start = Get-Date
+$procs = Get-Instances
+if ($procs.Count -eq 0) { Write-Host 'NVDisplay.Container.exe is not running.' -ForegroundColor Red; exit 1 }
+$last  = Get-Counters $procs
+foreach ($x in $procs | Sort-Object WriteTransferCount -Descending) {
+    $mb  = $x.WriteTransferCount / 1MB
+    $upH = ((Get-Date) - $x.CreationDate).TotalHours
+    Write-Host ("PID {0} already wrote {1:N1} MB since it started {2:N1} h ago (~{3:N0} MB/h, includes boot burst)" -f $x.ProcessId, $mb, $upH, ($mb / [math]::Max($upH, 0.01)))
+}
 Write-Host ''
 
 $totalMB   = 0.0
@@ -65,17 +73,25 @@ $hourNo    = 0
 while ((Get-Date) -lt $end) {
     Start-Sleep -Seconds $IntervalSec
     $now = Get-Date
-    $p   = Get-Main
-    if (-not $p) { Write-Host ("{0:HH:mm:ss}  process not running" -f $now) -ForegroundColor DarkYellow; continue }
-    $mb = $p.WriteTransferCount / 1MB
-    if ($p.ProcessId -ne $lastPid) {
-        Write-Host ("{0:HH:mm:ss}  PID changed {1} -> {2} (service restarted)" -f $now, $lastPid, $p.ProcessId) -ForegroundColor DarkYellow
-        $delta = $mb; $lastPid = $p.ProcessId
-    } else { $delta = [math]::Max($mb - $lastMB, 0) }
-    $lastMB = $mb
+    $procs = Get-Instances
+    if ($procs.Count -eq 0) { Write-Host ("{0:HH:mm:ss}  process not running" -f $now) -ForegroundColor DarkYellow; continue }
+    $cur   = Get-Counters $procs
+    # delta per PID: a PID seen before adds its increase; a new PID (service restarted) adds all it wrote so far
+    $deltaB = 0.0
+    foreach ($id in $cur.Keys) {
+        if ($last.ContainsKey($id)) { $deltaB += [math]::Max($cur[$id] - $last[$id], 0) }
+        else {
+            Write-Host ("{0:HH:mm:ss}  new PID {1} (service restarted?)" -f $now, $id) -ForegroundColor DarkYellow
+            $deltaB += $cur[$id]
+        }
+    }
+    $last  = $cur
+    $delta = $deltaB / 1MB
+    $mb    = ($cur.Values | Measure-Object -Sum).Sum / 1MB
+    $pids  = ($cur.Keys | Sort-Object) -join ' '
     $totalMB += $delta; $hourMB += $delta
     $len = if (Test-Path $nvlog) { (Get-Item $nvlog).Length } else { '' }
-    "{0:yyyy-MM-dd HH:mm:ss},{1},{2:F1},{3:F2},{4}" -f $now, $p.ProcessId, $mb, $delta, $len | Out-File $csv -Append -Encoding utf8
+    "{0:yyyy-MM-dd HH:mm:ss},{1},{2:F1},{3:F2},{4}" -f $now, $pids, $mb, $delta, $len | Out-File $csv -Append -Encoding utf8
 
     $rate = $delta * 3600 / $IntervalSec
     $v = Get-Verdict $rate
